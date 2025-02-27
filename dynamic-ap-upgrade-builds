@@ -1,0 +1,232 @@
+import requests
+import json
+import urllib3
+from tabulate import tabulate  # Import tabulate for table formatting
+import time
+
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Standard variables
+# Standard variables
+MIST_API_TOKEN = "ghh"
+MIST_BASE_URL = "https://api.mist.com/api/v1"
+ORG_ID = "hjjjgjgj"
+# List of sites and their names
+SITES = {
+    "USTEST03 - San Mateo": None,  # Site ID will be fetched dynamically
+    "USTEST04 - San Mateo": None
+}
+
+# Target OS version
+OS_VERSION = "0.12.27374"  # Replace with the desired OS version
+
+
+# Function to get all sites
+def get_sites(org_id, api_token):
+    url = f"{MIST_BASE_URL}/orgs/{org_id}/sites"
+    headers = {
+        "Authorization": f"Token {api_token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed while fetching sites: {e}")
+        return None
+
+
+# Function to get available versions for devices in a site
+def get_available_versions(site_id, api_token, model=None):
+    url = f"{MIST_BASE_URL}/sites/{site_id}/devices/versions"
+    headers = {
+        "Authorization": f"Token {api_token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+
+        available_versions = response.json()
+        print("Raw response for available versions:", available_versions)
+
+        # Filter available versions by model if specified
+        if model:
+            available_versions = [
+                version for version in available_versions if version.get('model') == model
+            ]
+
+        # Extract version numbers and sort
+        if available_versions:
+            versions = [version['version'] for version in available_versions]
+            sorted_versions = sorted(versions, key=lambda v: tuple(map(int, v.split('.'))), reverse=True)
+
+            # Return the sorted versions
+            return sorted_versions
+
+        return []
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed while fetching available versions: {e}")
+        return []
+
+
+# Function to get device details for a site
+def get_device_details(site_id, api_token):
+    url = f"{MIST_BASE_URL}/sites/{site_id}/stats/devices?type=ap"
+    headers = {
+        "Authorization": f"Token {api_token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed while fetching device details: {e}")
+        return None
+
+
+# Function to upgrade AP firmware
+def upgrade_ap_firmware(site_id, device_ids, api_token, version):
+    if not device_ids:
+        print("No eligible devices for upgrade. Skipping request.")
+        return False
+
+    url = f"{MIST_BASE_URL}/sites/{site_id}/devices/upgrade"
+    headers = {
+        "Authorization": f"Token {api_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "version": version,
+        "device_ids": device_ids,
+        "strategy": "canary",
+        "canary_phases": [5, 25, 50, 100],
+        "max_failures": [1, 1, 5, 5],
+        "enable_p2p": True,
+        "p2p_parallelism": 2,
+        "p2p_cluster_size": 10,
+        "reboot": True,
+        "force": True
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, verify=False)
+        response.raise_for_status()
+        print(f"✅ Upgrade triggered successfully for Site ID {site_id}")
+        return True
+    except requests.exceptions.HTTPError as http_err:
+        print(f"❌ HTTP Error: {http_err}")
+        print(f"❌ Response Content: {response.text}")
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"❌ API request failed while triggering upgrade for Site ID {site_id}: {e}")
+        return False
+
+
+# Function to check if all devices are upgraded and connected
+def check_upgrade_status(site_id, api_token, device_ids):
+    # Poll devices for status after the upgrade
+    print("Verifying upgrade status...")
+    for attempt in range(5):  # Retry a few times, increasing the wait time
+        devices = get_device_details(site_id, api_token)
+        if devices:
+            all_upgraded = True
+            for device in devices:
+                device_id = device.get('id')
+                if device_id in device_ids:
+                    firmware_version = device.get('version', 'N/A')
+                    ap_status = device.get('status', 'N/A')
+                    if firmware_version != OS_VERSION or ap_status != 'connected':
+                        all_upgraded = False
+                        print(f"❌ Device {device_id} failed to upgrade or is not connected.")
+            if all_upgraded:
+                print("✅ All devices upgraded successfully and are online.")
+                return True
+        print(f"🔄 Retrying in 3 minutes... (Attempt {attempt + 1}/5)")
+        time.sleep(180)  # Wait 3 minutes before retrying
+
+
+# Main execution
+if __name__ == "__main__":
+    print("Fetching all sites...\n")
+    sites = get_sites(ORG_ID, MIST_API_TOKEN)
+
+    if not sites:
+        print("Failed to fetch sites. Exiting.")
+        exit()
+
+    for site_name in SITES.keys():
+        target_site = next((site for site in sites if site["name"].lower() == site_name.lower()), None)
+        if target_site:
+            SITES[site_name] = target_site["id"]
+        else:
+            print(f"Site '{site_name}' not found. Skipping.")
+
+    for site_name, site_id in SITES.items():
+        if site_id:
+            print(f"\n===== 📍 Site Name: {site_name} | Site ID: {site_id} =====\n")
+
+            # Get available versions dynamically, specifying model
+            model_type = "AP43"  # For your case, specify AP43 model here
+            available_versions = get_available_versions(site_id, MIST_API_TOKEN, model=model_type)
+
+            if available_versions:
+                if len(available_versions) >= 2:
+                    latest_version = available_versions[0]
+                    latest_1_version = available_versions[1]
+                    print(f"✅ Latest-1 firmware version for upgrade: {latest_1_version}")
+                    OS_VERSION = latest_1_version  # Update OS_VERSION to Latest-1 version
+
+            devices = get_device_details(site_id, MIST_API_TOKEN)
+            device_ids = []
+            table_data = []
+
+            if devices:
+                for device in devices:
+                    device_name = device.get('name', 'N/A')
+                    model = device.get('model', 'N/A')
+                    firmware_version = device.get('version', 'N/A')
+                    device_id = device.get('id', 'N/A')
+                    ap_ip = device.get('ip', 'N/A')  # Get AP IP Address
+                    ap_status = "🟢 Connected" if device.get('status') == 'connected' else "🔴 Disconnected"
+
+                    if firmware_version == OS_VERSION:
+                        status = "✅ Already on target version"
+                    elif firmware_version > OS_VERSION:
+                        status = "⚠️ Newer than target (Skipping)"
+                    else:
+                        status = "⬆️ Needs Upgrade"
+                        device_ids.append(device_id)
+
+                    table_data.append([device_name, model, ap_ip, ap_status, firmware_version, OS_VERSION, status])
+
+                # Print table with AP IP and Status
+                headers = ["Device Name", "Model", "AP IP", "Status", "Current Firmware", "Target OS Version",
+                           "Upgrade Status"]
+                print(tabulate(table_data, headers=headers, tablefmt="fancy_grid"))
+
+                if device_ids:
+                    confirm = input(
+                        f"\nDo you want to proceed with the OS upgrade for site '{site_name}'? Type 'yes' to continue: ").strip().lower()
+                    if confirm == "yes":
+                        print(f"Triggering upgrade for site '{site_name}' to OS version: {OS_VERSION}")
+                        if upgrade_ap_firmware(site_id, device_ids, MIST_API_TOKEN, OS_VERSION):
+                            if check_upgrade_status(site_id, MIST_API_TOKEN, device_ids):
+                                print(f"Upgrade completed successfully for site '{site_name}'.\n")
+                            else:
+                                print(f"Upgrade failed for site '{site_name}'. Exiting.")
+                                exit()
+                        else:
+                            print(f"Upgrade failed to trigger for site '{site_name}'. Exiting.")
+                            exit()
+                    else:
+                        print(f"Upgrade canceled for site '{site_name}'.")
+                else:
+                    print(f"No devices require an upgrade for site '{site_name}'.\n")
+        else:
+            print(f"Site ID not found for site '{site_name}'. Skipping.")
+
+
